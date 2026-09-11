@@ -1,0 +1,40 @@
+name: BTC SMC Monitor (15m)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet requests
+
+      - name: Run SMC monitor
+        env:
+          SYMBOL:            BTCUSDT
+          INTERVAL:          15m
+          KLINE_LIMIT:       300
+          LOOKBACK_INNER:    5
+          LOOKBACK_SWING:    20
+          TG_BOT_TOKEN:      ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:        ${{ secrets.TG_CHAT_ID }}
+          QQ_EMAIL:          ${{ secrets.QQ_EMAIL }}
+          QQ_EMAIL_PASSWORD: ${{ secrets.QQ_EMAIL_PASSWORD }}
+          QQ_EMAIL_TO:       ${{ secrets.QQ_EMAIL_TO }}
+          SC_SENDKEY:        ${{ secrets.SC_SENDKEY }}
+          GIST_ID:           ${{ secrets.GIST_ID }}
+          GH_TOKEN:          ${{ secrets.GH_TOKEN }}
+          MIN_PCT_CHANGE:    ${{ secrets.MIN_PCT_CHANGE }}
+          COOLDOWN_SEC:      ${{ secrets.COOLDOWN_SEC }}
+        run: python python.py
