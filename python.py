@@ -227,7 +227,7 @@ def load_state():
         r.raise_for_status()
         files = r.json().get("files", {})
         content = files.get("state.json", {}).get("content", "{}")
-        return json.loads
+        return json.loads(content)
         return json.loads(content)
     except Exception as e:
         log.error("Gist 状态读取失败: %s", e)
