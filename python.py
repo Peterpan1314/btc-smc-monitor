@@ -31,30 +31,33 @@ MIN_PCT      = float(os.environ.get("MIN_PCT_CHANGE", "0.3"))
 
 # ===== 币安公开 K线 =====
 def fetch_klines(symbol, interval, limit):
-    url = "https://api.binance.com/api/v3/klines"
+    """从 OKX 公开 API 获取 K 线数据"""
+    url = "https://www.okx.com/api/v5/market/history-candles"
+    params = {"instId": "BTC-USDT", "bar": "15m", "limit": limit}
     try:
-        r = requests.get(url, params={
-            "symbol": symbol, "interval": interval, "limit": limit
-        }, timeout=30)
+        r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
+        if data.get("code") != "0":
+            log.error("OKX API 返回错误: %s", data.get("msg"))
+            return []
     except Exception as e:
-        log.error("币安API失败: %s", e)
+        log.error("OKX API 请求失败: %s", e)
         return []
 
     out = []
-    for c in data:
+    for c in data["data"]:
         out.append({
-            "close_time": c[6],
+            "close_time": int(c[0]) * 1000,
             "open": float(c[1]),
             "high": float(c[2]),
             "low": float(c[3]),
             "close": float(c[4]),
         })
-    # 剔除尚未收盘的 bar
     now_ms = int(time.time() * 1000)
     done = [c for c in out if c["close_time"] < now_ms - 60000]
     return done if done else out
+
 
 
 # ===== 摆点检测 =====
