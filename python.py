@@ -68,6 +68,39 @@ COOLDOWN_SEC   = int(os.environ.get("COOLDOWN_SEC", "1800"))     # 冷却秒数�
 # 币安公开 K线
 # ============================================================
 def fetch_klines(symbol, interval, limit):
+    """
+    从 Yahoo Finance 获取 BTC-USD 15m K 线数据
+    Yahoo 对 GitHub Actions 友好，无需 API key
+    """
+    import yfinance as yf
+    ticker = "BTC-USD"
+    try:
+        df = yf.download(ticker, period="7d", interval="15m", progress=False, timeout=30)
+        if df.empty:
+            log.error("yfinance 返回空数据")
+            return []
+        candles = []
+        for idx, row in df.iterrows():
+            candles.append({
+                "close_time": int(idx.timestamp() * 1000),
+                "open":  float(row["Open"]),
+                "high":  float(row["High"]),
+                "low":   float(row["Low"]),
+                "close": float(row["Close"]),
+            })
+        now_ms = int(time.time() * 1000)
+        complete = [c for c in candles if c["close_time"] < now_ms - 60000]
+        if not complete:
+            log.warning("未找到已收口 K 线，改用全部 %d 根", len(candles))
+            complete = candles
+        log.info("从 yfinance 获取到 %d 条 15m K 线 (BTC-USD)", len(complete))
+        return complete
+    except Exception as e:
+        log.error("yfinance 数据获取失败: %s", e)
+        import traceback
+        log.debug(traceback.format_exc())
+        return []
+
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=30)
