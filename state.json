@@ -1,9 +1,9 @@
 {
-  "inner_trend": 1,
+  "inner_trend": -1,
   "inner_last_high": 78232.5,
-  "inner_last_low": 78064.8,
-  "inner_last_price": 78607.8,
-  "inner_last_time": 1789246096,
+  "inner_last_low": 77840.0,
+  "inner_last_price": 77840.0,
+  "inner_last_time": 1789310278,
   "inner_hi_idx": 293,
   "inner_lo_idx": 291,
   "swing_trend": 1,
@@ -13,5 +13,5 @@
   "swing_last_time": 1789237448,
   "swing_hi_idx": 267,
   "swing_lo_idx": 279,
-  "last_update": 1789295404
+  "last_update": 1789310280
 }
