@@ -29,6 +29,27 @@ COOLDOWN     = int(os.environ.get("COOLDOWN_SEC", "1800"))
 MIN_PCT      = float(os.environ.get("MIN_PCT_CHANGE", "0.3"))
 
 
+# ===== 实时行情价格 =====
+def fetch_current_price():
+    """获取当前 BTC 实时价格（用于邮件展示）"""
+    urls = [
+        ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", "last"),
+        ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price"),
+    ]
+    for url, key in urls:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if key == "last":
+                    if data.get("code") == "0":
+                        return float(data["data"][0]["last"])
+                elif key == "price":
+                    return float(data["price"])
+        except Exception:
+            continue
+    return None
+
 # ===== 币安公开 K线 =====
 def fetch_klines(symbol, interval, limit):
     """从 OKX 公开 API 获取 K 线数据"""
@@ -226,9 +247,11 @@ def main():
             alerts.append((mon.label, sig, msg))
 
     if alerts:
-        body = "BTCUSDT 15m SMC 信号\n\n" + \
+        current_price = fetch_current_price()
+        price_line = f"\n\n当前行情: {current_price:,.2f} USD" if current_price else ""
+        body = "BTCUSDT 15m SMC 信号" + price_line + "\n\n" + \
                "\n\n".join(f"[{w}] {m}" for w, _, m in alerts) + "\n"
-        log.info("发送邮件:\n%s", body)
+        log.info("发送邮件:\\n%s", body)
         send_email("BTC SMC 信号提醒", body)
 
     st["inner_trend"]      = inner.trend
