@@ -6,12 +6,12 @@
   "inner_last_time": 1789560354,
   "inner_hi_idx": 293,
   "inner_lo_idx": 294,
-  "swing_trend": -1,
-  "swing_last_high": 77344.1,
+  "swing_trend": 1,
+  "swing_last_high": 77377.9,
   "swing_last_low": 76650.1,
-  "swing_last_price": 76650.1,
-  "swing_last_time": 1789560354,
+  "swing_last_price": 77377.9,
+  "swing_last_time": 1789588581,
   "swing_hi_idx": 279,
   "swing_lo_idx": 279,
-  "last_update": 1789577807
+  "last_update": 1789588585
 }
