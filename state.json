@@ -1,17 +1,17 @@
 {
   "inner_trend": -1,
   "inner_last_high": 79136.8,
-  "inner_last_low": 75938.8,
-  "inner_last_price": 75938.8,
-  "inner_last_time": 1789753310,
+  "inner_last_low": 75448.9,
+  "inner_last_price": 75448.9,
+  "inner_last_time": 1789778040,
   "inner_hi_idx": 294,
   "inner_lo_idx": 294,
   "swing_trend": -1,
   "swing_last_high": 79136.8,
-  "swing_last_low": 75938.8,
-  "swing_last_price": 75938.8,
-  "swing_last_time": 1789753310,
+  "swing_last_low": 75448.9,
+  "swing_last_price": 75448.9,
+  "swing_last_time": 1789778040,
   "swing_hi_idx": 279,
   "swing_lo_idx": 279,
-  "last_update": 1789770586
+  "last_update": 1789778044
 }
