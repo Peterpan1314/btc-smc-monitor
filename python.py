@@ -1,279 +1,137 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BTC 15m SMC Monitor - 币安公开API + QQ邮箱告警
-检测 BTCUSDT 15m，内部结构 + Swing 结构的 BOS/CHoCH，触发时发 QQ 邮件
-GitHub Actions 每 15 分钟跑一次，免费、云端、长期运行
-"""
+"""BTCUSDT 15m LuxAlgo-style SMC structure alerts.
 
-import os, json, time, logging, smtplib, requests
-from email.mime.text import MIMEText
+Swing/internal pivots follow LuxAlgo's leg transition model (default lengths 50/5).
+Breaks are intentionally wick-triggered per operator preference.
+"""
+import json, logging, os, smtplib, time
 from email.header import Header
+from email.mime.text import MIMEText
+import requests
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger("btc")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("btc-smc")
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+INTERVAL = os.getenv("INTERVAL", "15m")
+PIVOT_INTERNAL = int(os.getenv("LOOKBACK_INNER", "5"))
+PIVOT_SWING = int(os.getenv("LOOKBACK_SWING", "50"))
+LIMIT = int(os.getenv("KLINE_LIMIT", "1000"))
+COOLDOWN = int(os.getenv("COOLDOWN_SEC", "0"))
+EMAIL = os.getenv("QQ_EMAIL", "")
+PASSWORD = os.getenv("QQ_EMAIL_PASSWORD", "")
+TO = os.getenv("QQ_EMAIL_TO", EMAIL)
+STATE_PATH = "state.json"
+BASE = "https://api.binance.com"
 
-# ===== 配置（环境变量优先，否则用下面写死的默认值）=====
-SYMBOL       = os.environ.get("SYMBOL", "BTCUSDT")
-INTERVAL     = os.environ.get("INTERVAL", "15m")
-KLINE_LIMIT  = int(os.environ.get("KLINE_LIMIT", "300"))
+def fetch_klines(symbol=SYMBOL, interval=INTERVAL, limit=LIMIT):
+    r = requests.get(BASE + "/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}, timeout=20)
+    r.raise_for_status()
+    now = int(time.time() * 1000)
+    # Exclude currently forming bar; the monitor runs every 15m and confirms the last closed candle.
+    return [{"open_time": int(x[0]), "open": float(x[1]), "high": float(x[2]),
+             "low": float(x[3]), "close": float(x[4]), "close_time": int(x[6])}
+            for x in r.json() if int(x[6]) < now]
 
-LOOKBACK_IN  = int(os.environ.get("LOOKBACK_INNER", "5"))   # 内部结构
-LOOKBACK_SW  = int(os.environ.get("LOOKBACK_SWING", "20"))  # Swing 结构
+def empty_state():
+    return {"version": 2, "trend": 0, "high": None, "low": None,
+            "high_time": None, "low_time": None, "last_break_high": None,
+            "last_break_low": None, "last_alert_time": 0}
 
-QQ_EMAIL     = os.environ.get("QQ_EMAIL", "2994913023@qq.com")
-QQ_PASS      = os.environ.get("QQ_EMAIL_PASSWORD", "bukykubpwaztdeii")
-QQ_TO        = os.environ.get("QQ_EMAIL_TO", QQ_EMAIL)
-
-COOLDOWN     = int(os.environ.get("COOLDOWN_SEC", "1800"))
-MIN_PCT      = float(os.environ.get("MIN_PCT_CHANGE", "0.3"))
-
-
-# ===== 实时行情价格 =====
-def fetch_current_price():
-    """获取当前 BTC 实时价格（用于邮件展示）"""
-    urls = [
-        ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", "last"),
-        ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price"),
-    ]
-    for url, key in urls:
-        try:
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if key == "last":
-                    if data.get("code") == "0":
-                        return float(data["data"][0]["last"])
-                elif key == "price":
-                    return float(data["price"])
-        except Exception:
-            continue
-    return None
-
-# ===== 币安公开 K线 =====
-def fetch_klines(symbol, interval, limit):
-    """从 OKX 公开 API 获取 K 线数据"""
-    url = "https://www.okx.com/api/v5/market/history-candles"
-    params = {"instId": "BTC-USDT", "bar": "15m", "limit": limit}
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != "0":
-            log.error("OKX API 返回错误: %s", data.get("msg"))
-            return []
-    except Exception as e:
-        log.error("OKX API 请求失败: %s", e)
-        return []
-
-    out = []
-    for c in data["data"]:
-        out.append({
-            "close_time": int(c[0]) * 1000,
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-        })
-    now_ms = int(time.time() * 1000)
-    done = [c for c in out if c["close_time"] < now_ms - 60000]
-    return done if done else out
-
-
-
-# ===== 摆点检测 =====
-def find_pivots(candles, lookback):
-    pvt = []
-    n = len(candles)
-    if n < 2 * lookback + 1:
-        return pvt
-    for i in range(lookback, n - lookback):
-        hi = max(candles[j]["high"] for j in range(i - lookback, i + lookback + 1))
-        lo = min(candles[j]["low"]  for j in range(i - lookback, i + lookback + 1))
-        if candles[i]["high"] == hi:
-            pvt.append({"idx": i, "type": "high", "price": candles[i]["high"]})
-        if candles[i]["low"] == lo:
-            pvt.append({"idx": i, "type": "low",  "price": candles[i]["low"]})
-    return pvt
-
-
-# ===== 结构监控：BOS / CHoCH =====
-class StructureMonitor:
-    def __init__(self, lookback, label):
-        self.lb = lookback
-        self.label = label
-        self.trend = 0         # 0=未初始化, 1=牛, -1=熊
-        self.last_high = 0.0
-        self.last_low  = 0.0
-        self.last_price = 0.0  # 触发时的价格
-        self.last_time  = 0    # 触发时的秒数
-        self._hi_idx = -1
-        self._lo_idx = -1
-
-    def update(self, candles):
-        pvt = find_pivots(candles, self.lb)
-        if not pvt:
-            return None, None
-
-        for p in pvt:
-            if p["type"] == "high" and p["idx"] > self._hi_idx:
-                self.last_high = p["price"]
-                self._hi_idx = p["idx"]
-            if p["type"] == "low" and p["idx"] > self._lo_idx:
-                self.last_low = p["price"]
-                self._lo_idx = p["idx"]
-
-        # 初始化趋势
-        if self.trend == 0:
-            highs = [p for p in pvt if p["type"] == "high"]
-            lows  = [p for p in pvt if p["type"] == "low"]
-            if highs and lows:
-                self.trend = -1 if highs[0]["idx"] > lows[0]["idx"] else 1
-            elif highs:
-                self.trend = -1
-            elif lows:
-                self.trend = 1
-            return None, None
-
-        cur  = candles[-1]["close"]
-        now  = int(time.time())
-
-        # 防重复：冷却 + 最小变化
-        if now - self.last_time < COOLDOWN:
-            return None, None
-        if self.last_price > 0 and abs(cur - self.last_price) / self.last_price * 100 < MIN_PCT:
-            return None, None
-
-        if cur > self.last_high:
-            if self.trend == 1:
-                sig, msg = "BULL_BOS", f"🟢 BTCUSDT 15m {self.label} 牛BOS\n前高 {self.last_high:,.2f} → 现价 {cur:,.2f}"
-            else:
-                sig, msg = "BEAR_CHOCH", f"🔴 BTCUSDT 15m {self.label} 熊转牛（CHoCH）\n突破前高 {self.last_high:,.2f} → 现价 {cur:,.2f}\n可能转牛，注意观察"
-                self.trend = 1
-            self.last_price = cur
-            self.last_time  = now
-            self.last_high  = cur
-            return sig, msg
-
-        if cur < self.last_low:
-            if self.trend == -1:
-                sig, msg = "BEAR_BOS", f"🔴 BTCUSDT 15m {self.label} 熊BOS\n前低 {self.last_low:,.2f} → 现价 {cur:,.2f}"
-            else:
-                sig, msg = "BULL_CHOCH", f"🟢 BTCUSDT 15m {self.label} 牛转熊（CHoCH）\n跌破前低 {self.last_low:,.2f} → 现价 {cur:,.2f}\n可能转熊，注意观察"
-                self.trend = -1
-            self.last_price = cur
-            self.last_time  = now
-            self.last_low   = cur
-            return sig, msg
-
-        return None, None
-
-
-# ===== QQ 邮箱告警 =====
-def send_email(subject, body):
-    if not (QQ_EMAIL and QQ_PASS):
-        log.warning("邮箱未配置")
-        return
-    try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"]    = QQ_EMAIL
-        msg["To"]      = QQ_TO
-        s = smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30)
-        s.login(QQ_EMAIL, QQ_PASS)
-        s.sendmail(QQ_EMAIL, [QQ_TO], msg.as_string())
-        s.quit()
-        log.info("邮件已发送至 %s", QQ_TO)
-    except Exception as e:
-        log.error("邮件失败: %s", e)
-
-
-# ===== state.json 持久化 =====
 def load_state():
     try:
-        with open("state.json") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(STATE_PATH, encoding="utf-8") as f: return json.load(f)
+    except (OSError, ValueError): return {}
 
-def save_state(s):
-    try:
-        with open("state.json", "w") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.warning("写 state.json 失败: %s", e)
+def save_state(state):
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
+def find_leg_pivots(candles, length):
+    """LuxAlgo leg() semantics: compare bar[length] with the preceding length bars.
+    Pivot is confirmed length bars after its origin; later pivots replace same-side levels.
+    """
+    pivots = []
+    for i in range(length, len(candles)):
+        prior = candles[i-length:i]
+        pivot = candles[i-length]
+        new_high = pivot["high"] > max(x["high"] for x in prior)
+        new_low = pivot["low"] < min(x["low"] for x in prior)
+        if new_high: pivots.append((i, "high", pivot["high"], pivot["open_time"]))
+        elif new_low: pivots.append((i, "low", pivot["low"], pivot["open_time"]))
+    return pivots
 
-# ===== 主流程 =====
+def detect_structure(candles, length, previous):
+    state = dict(previous or {})
+    if state.get("version") != 2 or state.get("length") != length:
+        state = empty_state()
+        # Replay closed history to reconstruct trend and live levels, without emitting old alerts.
+        replay = True
+    else: replay = False
+    state["length"] = length
+    # Process pivots incrementally in chronological order and test wick breaks after pivot updates.
+    # Rebuild from a stable history window on every scheduled run, deduping by pivot timestamps.
+    state = empty_state() | {"length": length}
+    events = []
+    pivots = find_leg_pivots(candles, length)
+    by_confirm = {}
+    for p in pivots: by_confirm.setdefault(p[0], []).append(p)
+    trend = 0
+    last_high = last_low = None
+    high_time = low_time = None
+    for i, bar in enumerate(candles):
+        for _, side, price, origin_time in by_confirm.get(i, []):
+            if side == "high": last_high, high_time = price, origin_time
+            else: last_low, low_time = price, origin_time
+        if trend == 0:
+            ps = by_confirm.get(i, [])
+            if ps: trend = -1 if ps[-1][1] == "high" else 1
+        # A touch is a crossing from the prior bar's range into the level.
+        if i == 0: continue
+        prev = candles[i-1]
+        if last_high is not None and prev["high"] < last_high <= bar["high"]:
+            kind = "BULL_BOS" if trend == 1 else "BULL_CHOCH"
+            events.append({"kind":kind, "level":last_high,"price":last_high,"time":bar["close_time"],"pivot_time":high_time})
+            trend = 1
+            last_high = None
+        elif last_low is not None and prev["low"] > last_low >= bar["low"]:
+            kind = "BEAR_BOS" if trend == -1 else "BEAR_CHOCH"
+            events.append({"kind":kind, "level":last_low,"price":last_low,"time":bar["close_time"],"pivot_time":low_time})
+            trend = -1
+            last_low = None
+    state.update({"trend":trend,"high":last_high,"low":last_low,"high_time":high_time,"low_time":low_time,
+                  "last_break_high":next((e["time"] for e in reversed(events) if e["kind"].startswith("BULL")),None),
+                  "last_break_low":next((e["time"] for e in reversed(events) if e["kind"].startswith("BEAR")),None)})
+    # Only the newest candle's events can be new notifications; older events are historical reconstruction.
+    latest = candles[-1]["close_time"] if candles else None
+    return state, [e for e in events if e["time"] == latest]
+
+def send_email(subject, body):
+    if not (EMAIL and PASSWORD and TO):
+        raise RuntimeError("QQ_EMAIL, QQ_EMAIL_PASSWORD and QQ_EMAIL_TO secrets must be configured")
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8"); msg["From"] = EMAIL; msg["To"] = TO
+    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as smtp:
+        smtp.login(EMAIL, PASSWORD); smtp.sendmail(EMAIL, [TO], msg.as_string())
+
 def main():
-    log.info("拉取 %s %s K线 (limit=%d)...", SYMBOL, INTERVAL, KLINE_LIMIT)
-    candles = fetch_klines(SYMBOL, INTERVAL, KLINE_LIMIT)
-    log.info("得到 %d 根 K 线", len(candles))
-
-    if len(candles) < 2 * max(LOOKBACK_IN, LOOKBACK_SW) + 1:
-        log.warning("K线太少，跳过本次")
-        save_state({})
-        return
-
-    st = load_state()
-
-    inner = StructureMonitor(LOOKBACK_IN, "内部结构")
-    swing = StructureMonitor(LOOKBACK_SW, "Swing结构")
-
-    for k, v in [
-        ("trend", "inner_trend"), ("last_high", "inner_last_high"),
-        ("last_low", "inner_last_low"), ("last_price", "inner_last_price"),
-        ("last_time", "inner_last_time"), ("_hi_idx", "inner_hi_idx"),
-        ("_lo_idx", "inner_lo_idx"),
-    ]:
-        setattr(inner, k, st.get(v, -1 if "idx" in k else 0))
-
-    for k, v in [
-        ("trend", "swing_trend"), ("last_high", "swing_last_high"),
-        ("last_low", "swing_last_low"), ("last_price", "swing_last_price"),
-        ("last_time", "swing_last_time"), ("_hi_idx", "swing_hi_idx"),
-        ("_lo_idx", "swing_lo_idx"),
-    ]:
-        setattr(swing, k, st.get(v, -1 if "idx" in k else 0))
-
-    log.info("内: trend=%s high=%.2f low=%.2f", inner.trend, inner.last_high, inner.last_low)
-    log.info("摆: trend=%s high=%.2f low=%.2f", swing.trend, swing.last_high, swing.last_low)
-
-    alerts = []
-    for mon in (inner, swing):
-        sig, msg = mon.update(candles)
-        if sig:
-            log.info("[%s] 检测到: %s", mon.label, sig)
-            alerts.append((mon.label, sig, msg))
-
-    if alerts:
-        current_price = fetch_current_price()
-        price_line = f"\n\n当前行情: {current_price:,.2f} USD" if current_price else ""
-        body = "BTCUSDT 15m SMC 信号" + price_line + "\n\n" + \
-               "\n\n".join(f"[{w}] {m}" for w, _, m in alerts) + "\n"
-        log.info("发送邮件:\\n%s", body)
-        send_email("BTC SMC 信号提醒", body)
-
-    st["inner_trend"]      = inner.trend
-    st["inner_last_high"]  = inner.last_high
-    st["inner_last_low"]   = inner.last_low
-    st["inner_last_price"] = inner.last_price
-    st["inner_last_time"]  = inner.last_time
-    st["inner_hi_idx"]     = inner._hi_idx
-    st["inner_lo_idx"]     = inner._lo_idx
-
-    st["swing_trend"]      = swing.trend
-    st["swing_last_high"]  = swing.last_high
-    st["swing_last_low"]   = swing.last_low
-    st["swing_last_price"] = swing.last_price
-    st["swing_last_time"]  = swing.last_time
-    st["swing_hi_idx"]     = swing._hi_idx
-    st["swing_lo_idx"]     = swing._lo_idx
-
-    st["last_update"] = int(time.time())
-    save_state(st)
-    log.info("运行完成")
-
+    candles = fetch_klines()
+    if len(candles) < PIVOT_SWING * 2 + 3: raise RuntimeError("Insufficient closed candles")
+    old = load_state()
+    # Backfill only to reconstruct current structure, then alert on newest closed candle.
+    results = []
+    new = {"version":2}
+    for name, length in (("internal",PIVOT_INTERNAL),("swing",PIVOT_SWING)):
+        state, events = detect_structure(candles, length, old.get(name))
+        new[name] = state
+        results.extend((name, e) for e in events)
+    if results:
+        lines = [f"BTCUSDT 15m SMC wick-touch alert (closed candle)"]
+        for name,e in results:
+            lines.append(f'{name}: {e["kind"]}; broken level/trigger price {e["price"]:,.2f}; candle close {candles[-1]["close"]:,.2f}')
+        send_email("BTC 15m SMC signal", "\n".join(lines))
+    new["last_run"] = int(time.time())
+    save_state(new)
 
 if __name__ == "__main__":
     main()
