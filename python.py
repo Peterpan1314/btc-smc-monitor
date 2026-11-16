@@ -1,137 +1,177 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BTCUSDT 15m LuxAlgo-style SMC structure alerts.
+"""15m BTCUSDT SMC structure alerts using LuxAlgo's leg/pivot model.
 
-Swing/internal pivots follow LuxAlgo's leg transition model (default lengths 50/5).
-Breaks are intentionally wick-triggered per operator preference.
+Pivots use the supplied LuxAlgo defaults: internal=5, swing=50.
+Per request, a break is confirmed by a wick touching/crossing a level.
 """
-import json, logging, os, smtplib, time
+import json
+import logging
+import os
+import smtplib
+import time
 from email.header import Header
 from email.mime.text import MIMEText
+
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("btc-smc")
+
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
-PIVOT_INTERNAL = int(os.getenv("LOOKBACK_INNER", "5"))
-PIVOT_SWING = int(os.getenv("LOOKBACK_SWING", "50"))
-LIMIT = int(os.getenv("KLINE_LIMIT", "1000"))
-COOLDOWN = int(os.getenv("COOLDOWN_SEC", "0"))
+INTERNAL_LENGTH = int(os.getenv("LOOKBACK_INNER", "5"))
+SWING_LENGTH = int(os.getenv("LOOKBACK_SWING", "50"))
+KLINE_LIMIT = min(int(os.getenv("KLINE_LIMIT", "1000")), 1000)
+STATE_FILE = "state.json"
 EMAIL = os.getenv("QQ_EMAIL", "")
-PASSWORD = os.getenv("QQ_EMAIL_PASSWORD", "")
-TO = os.getenv("QQ_EMAIL_TO", EMAIL)
-STATE_PATH = "state.json"
-BASE = "https://api.binance.com"
+EMAIL_PASSWORD = os.getenv("QQ_EMAIL_PASSWORD", "")
+EMAIL_TO = os.getenv("QQ_EMAIL_TO", EMAIL)
+BINANCE = "https://api.binance.com"
 
-def fetch_klines(symbol=SYMBOL, interval=INTERVAL, limit=LIMIT):
-    r = requests.get(BASE + "/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}, timeout=20)
-    r.raise_for_status()
-    now = int(time.time() * 1000)
-    # Exclude currently forming bar; the monitor runs every 15m and confirms the last closed candle.
-    return [{"open_time": int(x[0]), "open": float(x[1]), "high": float(x[2]),
-             "low": float(x[3]), "close": float(x[4]), "close_time": int(x[6])}
-            for x in r.json() if int(x[6]) < now]
+def fetch_closed_klines():
+    response = requests.get(
+        f"{BINANCE}/api/v3/klines",
+        params={"symbol": SYMBOL, "interval": INTERVAL, "limit": KLINE_LIMIT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    now_ms = int(time.time() * 1000)
+    candles = []
+    for row in response.json():
+        if int(row[6]) >= now_ms:
+            continue
+        candles.append({
+            "time": int(row[0]), "close_time": int(row[6]),
+            "open": float(row[1]), "high": float(row[2]),
+            "low": float(row[3]), "close": float(row[4]),
+        })
+    return candles
 
-def empty_state():
-    return {"version": 2, "trend": 0, "high": None, "low": None,
-            "high_time": None, "low_time": None, "last_break_high": None,
-            "last_break_low": None, "last_alert_time": 0}
-
-def load_state():
-    try:
-        with open(STATE_PATH, encoding="utf-8") as f: return json.load(f)
-    except (OSError, ValueError): return {}
-
-def save_state(state):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-def find_leg_pivots(candles, length):
-    """LuxAlgo leg() semantics: compare bar[length] with the preceding length bars.
-    Pivot is confirmed length bars after its origin; later pivots replace same-side levels.
-    """
-    pivots = []
-    for i in range(length, len(candles)):
-        prior = candles[i-length:i]
-        pivot = candles[i-length]
-        new_high = pivot["high"] > max(x["high"] for x in prior)
-        new_low = pivot["low"] < min(x["low"] for x in prior)
-        if new_high: pivots.append((i, "high", pivot["high"], pivot["open_time"]))
-        elif new_low: pivots.append((i, "low", pivot["low"], pivot["open_time"]))
-    return pivots
-
-def detect_structure(candles, length, previous):
-    state = dict(previous or {})
-    if state.get("version") != 2 or state.get("length") != length:
-        state = empty_state()
-        # Replay closed history to reconstruct trend and live levels, without emitting old alerts.
-        replay = True
-    else: replay = False
-    state["length"] = length
-    # Process pivots incrementally in chronological order and test wick breaks after pivot updates.
-    # Rebuild from a stable history window on every scheduled run, deduping by pivot timestamps.
-    state = empty_state() | {"length": length}
+def confirmed_legs(candles, length):
+    """Return LuxAlgo-style leg changes, with pivot confirmation length bars later."""
     events = []
-    pivots = find_leg_pivots(candles, length)
-    by_confirm = {}
-    for p in pivots: by_confirm.setdefault(p[0], []).append(p)
+    leg = 0
+    for confirm_idx in range(length, len(candles)):
+        pivot_idx = confirm_idx - length
+        preceding = candles[pivot_idx - length:pivot_idx]
+        if len(preceding) < length:
+            continue
+        pivot = candles[pivot_idx]
+        is_high = pivot["high"] > max(c["high"] for c in preceding)
+        is_low = pivot["low"] < min(c["low"] for c in preceding)
+        next_leg = 0
+        if is_high:
+            next_leg = -1
+        elif is_low:
+            next_leg = 1
+        if next_leg and next_leg != leg:
+            leg = next_leg
+            side = "high" if leg == -1 else "low"
+            events.append({
+                "confirm_idx": confirm_idx, "pivot_idx": pivot_idx,
+                "side": side, "price": pivot[side], "pivot_time": pivot["time"],
+            })
+    return events
+
+def reconstruct(candles, length):
+    pivots = confirmed_legs(candles, length)
+    high = low = None
+    high_pivot_time = low_pivot_time = None
     trend = 0
-    last_high = last_low = None
-    high_time = low_time = None
-    for i, bar in enumerate(candles):
-        for _, side, price, origin_time in by_confirm.get(i, []):
-            if side == "high": last_high, high_time = price, origin_time
-            else: last_low, low_time = price, origin_time
-        if trend == 0:
-            ps = by_confirm.get(i, [])
-            if ps: trend = -1 if ps[-1][1] == "high" else 1
-        # A touch is a crossing from the prior bar's range into the level.
-        if i == 0: continue
-        prev = candles[i-1]
-        if last_high is not None and prev["high"] < last_high <= bar["high"]:
-            kind = "BULL_BOS" if trend == 1 else "BULL_CHOCH"
-            events.append({"kind":kind, "level":last_high,"price":last_high,"time":bar["close_time"],"pivot_time":high_time})
-            trend = 1
-            last_high = None
-        elif last_low is not None and prev["low"] > last_low >= bar["low"]:
-            kind = "BEAR_BOS" if trend == -1 else "BEAR_CHOCH"
-            events.append({"kind":kind, "level":last_low,"price":last_low,"time":bar["close_time"],"pivot_time":low_time})
-            trend = -1
-            last_low = None
-    state.update({"trend":trend,"high":last_high,"low":last_low,"high_time":high_time,"low_time":low_time,
-                  "last_break_high":next((e["time"] for e in reversed(events) if e["kind"].startswith("BULL")),None),
-                  "last_break_low":next((e["time"] for e in reversed(events) if e["kind"].startswith("BEAR")),None)})
-    # Only the newest candle's events can be new notifications; older events are historical reconstruction.
-    latest = candles[-1]["close_time"] if candles else None
-    return state, [e for e in events if e["time"] == latest]
+    pivot_by_confirmation = {}
+    for pivot in pivots:
+        pivot_by_confirmation.setdefault(pivot["confirm_idx"], []).append(pivot)
+    for i, candle in enumerate(candles):
+        for pivot in pivot_by_confirmation.get(i, []):
+            if pivot["side"] == "high":
+                high, high_pivot_time = pivot["price"], pivot["pivot_time"]
+            else:
+                low, low_pivot_time = pivot["price"], pivot["pivot_time"]
+        if trend == 0 and pivot_by_confirmation.get(i):
+            trend = 1 if pivot_by_confirmation[i][-1]["side"] == "low" else -1
+
+    # Only evaluate the newest closed candle for a new wick cross; never replay historical alerts.
+    if len(candles) < 2:
+        return {"trend": trend, "high": high, "low": low,
+                "high_pivot_time": high_pivot_time, "low_pivot_time": low_pivot_time}, []
+    prev, cur = candles[-2], candles[-1]
+    alerts = []
+    if high is not None and prev["high"] < high <= cur["high"]:
+        kind = "BULL_BOS" if trend == 1 else "BULL_CHOCH"
+        alerts.append({"kind": kind, "level": high, "wick": cur["high"],
+                       "candle_close": cur["close"], "time": cur["close_time"],
+                       "pivot_time": high_pivot_time})
+        trend = 1
+    if low is not None and prev["low"] > low >= cur["low"]:
+        kind = "BEAR_BOS" if trend == -1 else "BEAR_CHOCH"
+        alerts.append({"kind": kind, "level": low, "wick": cur["low"],
+                       "candle_close": cur["close"], "time": cur["close_time"],
+                       "pivot_time": low_pivot_time})
+        trend = -1
+    return {"trend": trend, "high": high, "low": low,
+            "high_pivot_time": high_pivot_time, "low_pivot_time": low_pivot_time}, alerts
+
+def read_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as handle:
+            value = json.load(handle)
+            return value if value.get("version") == 3 else {"version": 3, "last_processed": 0}
+    except (OSError, ValueError):
+        return {"version": 3, "last_processed": 0}
+
+def write_state(state):
+    temporary = STATE_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+    os.replace(temporary, STATE_FILE)
 
 def send_email(subject, body):
-    if not (EMAIL and PASSWORD and TO):
-        raise RuntimeError("QQ_EMAIL, QQ_EMAIL_PASSWORD and QQ_EMAIL_TO secrets must be configured")
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = Header(subject, "utf-8"); msg["From"] = EMAIL; msg["To"] = TO
+    if not (EMAIL and EMAIL_PASSWORD and EMAIL_TO):
+        raise RuntimeError("Configure QQ_EMAIL, QQ_EMAIL_PASSWORD and QQ_EMAIL_TO as GitHub Secrets")
+    message = MIMEText(body, "plain", "utf-8")
+    message["Subject"] = Header(subject, "utf-8")
+    message["From"], message["To"] = EMAIL, EMAIL_TO
     with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as smtp:
-        smtp.login(EMAIL, PASSWORD); smtp.sendmail(EMAIL, [TO], msg.as_string())
+        smtp.login(EMAIL, EMAIL_PASSWORD)
+        smtp.sendmail(EMAIL, [EMAIL_TO], message.as_string())
 
 def main():
-    candles = fetch_klines()
-    if len(candles) < PIVOT_SWING * 2 + 3: raise RuntimeError("Insufficient closed candles")
-    old = load_state()
-    # Backfill only to reconstruct current structure, then alert on newest closed candle.
-    results = []
-    new = {"version":2}
-    for name, length in (("internal",PIVOT_INTERNAL),("swing",PIVOT_SWING)):
-        state, events = detect_structure(candles, length, old.get(name))
-        new[name] = state
-        results.extend((name, e) for e in events)
-    if results:
-        lines = [f"BTCUSDT 15m SMC wick-touch alert (closed candle)"]
-        for name,e in results:
-            lines.append(f'{name}: {e["kind"]}; broken level/trigger price {e["price"]:,.2f}; candle close {candles[-1]["close"]:,.2f}')
+    candles = fetch_closed_klines()
+    if len(candles) < 2 * SWING_LENGTH + 2:
+        raise RuntimeError(f"Not enough closed candles: {len(candles)}")
+    previous_state = read_state()
+    current_close_time = candles[-1]["close_time"]
+    if current_close_time <= previous_state.get("last_processed", 0):
+        log.info("Already processed closed candle %s", current_close_time)
+        return
+
+    all_alerts = []
+    summaries = []
+    for name, length in (("Internal", INTERNAL_LENGTH), ("Swing", SWING_LENGTH)):
+        structure, alerts = reconstruct(candles, length)
+        summaries.append(f"{name}: trend={structure['trend']}, active_high={structure['high']}, active_low={structure['low']}")
+        for alert in alerts:
+            all_alerts.append((name, alert))
+    log.info("Structure levels: %s", " | ".join(summaries))
+
+    if all_alerts:
+        current = candles[-1]["close"]
+        lines = [f"BTCUSDT {INTERVAL} SMC wick-touch alert",
+                 f"Signal candle close: {current:,.2f} USDT",
+                 f"Signal candle high/low: {candles[-1]['high']:,.2f} / {candles[-1]['low']:,.2f} USDT"]
+        for name, alert in all_alerts:
+            lines.append(f"{name} {alert['kind']}: structure level {alert['level']:,.2f}; touched wick {alert['wick']:,.2f}; candle close {alert['candle_close']:,.2f}")
         send_email("BTC 15m SMC signal", "\n".join(lines))
-    new["last_run"] = int(time.time())
-    save_state(new)
+    else:
+        log.info("No new structure wick break on the latest closed candle")
+
+    previous_state.update({
+        "version": 3, "last_processed": current_close_time,
+        "internal": reconstruct(candles, INTERNAL_LENGTH)[0],
+        "swing": reconstruct(candles, SWING_LENGTH)[0],
+    })
+    write_state(previous_state)
 
 if __name__ == "__main__":
     main()
